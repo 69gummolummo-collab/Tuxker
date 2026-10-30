@@ -1,0 +1,1081 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - uses: android-actions/setup-android@v3
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Generate project files
+        run: |
+          mkdir ForenzaNav && cd ForenzaNav
+          mkdir -p "$(dirname '.gitignore')"
+          cat > '.gitignore' <<'FILE_EOF'
+          .gradle/
+          build/
+          local.properties
+          .idea/
+          *.iml
+          FILE_EOF
+          mkdir -p "$(dirname 'README.md')"
+          cat > 'README.md' <<'FILE_EOF'
+          # Forenza Nav
+
+          Garmin-style GPS navigation for Android (OpenStreetMap + OSRM routing).
+          A dark blue Suzuki Forenza is your position marker; above 35 mph it morphs into a
+          silver Pegasus (back to the car below 30 mph).
+
+          * Heading-up map that follows you, zooms out as you speed up
+          * Search a destination, turn-by-turn banner, voice prompts, rerouting, ETA
+          * Speed bubble (tap it to demo the morph at 50 mph without driving)
+          * Night mode toggle
+
+          ## Get the APK without Android Studio
+          1. Create a free GitHub account and a new empty repository.
+          2. Upload every file in this folder (including the hidden `.github` folder) to it.
+          3. Open the repo's **Actions** tab -> **Build APK** -> wait ~5 minutes for the green check.
+          4. Open the finished run, download the **ForenzaNav-APK** artifact (a zip), unzip it.
+          5. Copy `app-debug.apk` to your phone, open it, and allow "install unknown apps".
+
+          ## Android Studio
+          Open this folder, let Gradle sync, then Build > Build APK(s).
+          FILE_EOF
+          mkdir -p "$(dirname 'app/build.gradle.kts')"
+          cat > 'app/build.gradle.kts' <<'FILE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.forenzanav"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.forenzanav"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+
+          dependencies {
+              implementation("org.osmdroid:osmdroid-android:6.1.18")
+          }
+          FILE_EOF
+          mkdir -p "$(dirname 'app/src/main/AndroidManifest.xml')"
+          cat > 'app/src/main/AndroidManifest.xml' <<'FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+              <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
+              <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:allowBackup="true"
+                  android:label="Forenza Nav"
+                  android:theme="@android:style/Theme.Material.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FILE_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/forenzanav/CarView.kt')"
+          cat > 'app/src/main/java/com/example/forenzanav/CarView.kt' <<'FILE_EOF'
+          package com.example.forenzanav
+
+          import android.content.Context
+          import android.graphics.Canvas
+          import android.graphics.LinearGradient
+          import android.graphics.Paint
+          import android.graphics.Path
+          import android.graphics.RadialGradient
+          import android.graphics.RectF
+          import android.graphics.Shader
+          import android.util.AttributeSet
+          import android.view.View
+          import kotlin.math.max
+          import kotlin.math.min
+
+          /**
+           * Top-down vehicle marker, always pointing up (the map rotates under it).
+           * morph = 0 -> dark blue Suzuki Forenza, morph = 1 -> silver Pegasus with wings spread.
+           * Everything is drawn from vector paths in "units": 1 unit = view size / 5.6.
+           */
+          class CarView @JvmOverloads constructor(ctx: Context, attrs: AttributeSet? = null) : View(ctx, attrs) {
+
+              var morph: Float = 0f
+                  set(value) {
+                      field = value.coerceIn(0f, 1f)
+                      invalidate()
+                  }
+
+              private val p = Paint(Paint.ANTI_ALIAS_FLAG)
+              private val path = Path()
+              private val rect = RectF()
+
+              private fun fill(c: Canvas, color: Int) {
+                  p.shader = null; p.style = Paint.Style.FILL; p.color = color
+                  c.drawPath(path, p)
+              }
+
+              private fun stroke(c: Canvas, color: Int, w: Float) {
+                  p.shader = null; p.style = Paint.Style.STROKE; p.color = color; p.strokeWidth = w
+                  c.drawPath(path, p)
+              }
+
+              private fun poly(vararg pts: Float) {
+                  path.reset()
+                  path.moveTo(pts[0], pts[1])
+                  var i = 2
+                  while (i < pts.size) { path.lineTo(pts[i], pts[i + 1]); i += 2 }
+                  path.close()
+              }
+
+              private fun oval(c: Canvas, l: Float, t: Float, r: Float, b: Float, color: Int) {
+                  rect.set(l, t, r, b)
+                  p.shader = null; p.style = Paint.Style.FILL; p.color = color
+                  c.drawOval(rect, p)
+              }
+
+              private fun rrect(c: Canvas, l: Float, t: Float, r: Float, b: Float, rad: Float, color: Int) {
+                  rect.set(l, t, r, b)
+                  p.shader = null; p.style = Paint.Style.FILL; p.color = color
+                  c.drawRoundRect(rect, rad, rad, p)
+              }
+
+              override fun onDraw(c: Canvas) {
+                  val u = min(width, height) / 5.6f
+                  val t = morph
+                  c.save()
+                  c.translate(width / 2f, height / 2f)
+                  c.scale(u, u)
+
+                  if (t > 0f) drawPegasus(c, t)
+
+                  if (t < 1f) {
+                      val s = 1f - 0.3f * t
+                      c.save()
+                      c.scale(s, s)
+                      val layer = c.saveLayerAlpha(-4f, -4f, 4f, 4f, (255 * (1f - t)).toInt())
+                      drawForenza(c)
+                      c.restoreToCount(layer)
+                      c.restore()
+                  }
+                  c.restore()
+              }
+
+              // ---------------------------------------------------------------- Forenza
+              private fun drawForenza(c: Canvas) {
+                  val body = 0xFF0B2559.toInt()
+                  val glass = 0xFF8FB4D8.toInt()
+
+                  rrect(c, -0.62f, -1.25f, 0.72f, 1.45f, 0.4f, 0x44000000)          // shadow
+
+                  for (y in floatArrayOf(-0.95f, 0.6f)) {                              // wheels
+                      rrect(c, -0.6f, y, -0.46f, y + 0.4f, 0.05f, 0xFF111111.toInt())
+                      rrect(c, 0.46f, y, 0.6f, y + 0.4f, 0.05f, 0xFF111111.toInt())
+                  }
+                  rrect(c, -0.62f, -0.5f, -0.48f, -0.3f, 0.05f, body)                 // mirrors
+                  rrect(c, 0.48f, -0.5f, 0.62f, -0.3f, 0.05f, body)
+
+                  path.reset()                                                          // body shell
+                  path.moveTo(-0.34f, -1.3f); path.lineTo(0.34f, -1.3f)
+                  path.quadTo(0.5f, -1.25f, 0.5f, -1.0f); path.lineTo(0.5f, 1.0f)
+                  path.quadTo(0.5f, 1.3f, 0.3f, 1.3f); path.lineTo(-0.3f, 1.3f)
+                  path.quadTo(-0.5f, 1.3f, -0.5f, 1.0f); path.lineTo(-0.5f, -1.0f)
+                  path.quadTo(-0.5f, -1.25f, -0.34f, -1.3f); path.close()
+                  fill(c, body)
+                  stroke(c, 0xFF050F2B.toInt(), 0.03f)
+
+                  poly(-0.34f, -1.28f, 0.34f, -1.28f, 0.44f, -0.5f, -0.44f, -0.5f)    // hood sheen
+                  fill(c, 0xFF14408F.toInt())
+                  poly(-0.4f, -0.5f, 0.4f, -0.5f, 0.46f, -0.1f, -0.46f, -0.1f)        // windshield
+                  fill(c, glass)
+                  rrect(c, -0.44f, -0.1f, 0.44f, 0.5f, 0.1f, 0xFF0F2F70.toInt())      // roof
+                  poly(-0.44f, 0.5f, 0.44f, 0.5f, 0.38f, 0.85f, -0.38f, 0.85f)        // rear glass
+                  fill(c, 0xFF6F93B8.toInt())
+
+                  rrect(c, -0.44f, -1.29f, -0.2f, -1.2f, 0.04f, 0xFFFFF4C2.toInt())   // headlights
+                  rrect(c, 0.2f, -1.29f, 0.44f, -1.2f, 0.04f, 0xFFFFF4C2.toInt())
+                  rrect(c, -0.44f, 1.22f, -0.24f, 1.3f, 0.03f, 0xFFE53935.toInt())    // tail lights
+                  rrect(c, 0.24f, 1.22f, 0.44f, 1.3f, 0.03f, 0xFFE53935.toInt())
+              }
+
+              // ---------------------------------------------------------------- Pegasus
+              private fun drawPegasus(c: Canvas, t: Float) {
+                  val layer = c.saveLayerAlpha(-4f, -4f, 4f, 4f, (255 * t).toInt())
+                  val spread = max(0.05f, t)
+
+                  // glow
+                  p.style = Paint.Style.FILL
+                  p.shader = RadialGradient(0f, 0f, 2.8f, intArrayOf(0x66BFD9FF, 0x00BFD9FF), null, Shader.TileMode.CLAMP)
+                  c.drawCircle(0f, 0f, 2.8f, p)
+                  p.shader = null
+
+                  // tail
+                  path.reset()
+                  path.moveTo(-0.15f, 0.8f)
+                  path.cubicTo(-0.6f, 1.3f, 0.5f, 1.5f, -0.1f, 2.2f)
+                  path.cubicTo(0.9f, 1.6f, 0.5f, 1.2f, 0.15f, 0.8f)
+                  path.close()
+                  fill(c, 0xFFC9D3E6.toInt()); stroke(c, 0xFF8E98A8.toInt(), 0.03f)
+
+                  // wings (x scaled by spread so they unfold from the body)
+                  for (side in floatArrayOf(-1f, 1f)) {
+                      c.save()
+                      c.scale(side * spread, 1f)
+                      path.reset()
+                      path.moveTo(0.25f, -0.45f)
+                      path.cubicTo(1.0f, -1.0f, 1.9f, -1.1f, 2.7f, -0.6f)
+                      path.lineTo(2.35f, -0.4f); path.lineTo(2.6f, -0.05f); path.lineTo(2.1f, -0.1f)
+                      path.lineTo(2.3f, 0.3f); path.lineTo(1.8f, 0.2f); path.lineTo(1.9f, 0.6f)
+                      path.lineTo(1.3f, 0.4f); path.lineTo(1.2f, 0.7f); path.lineTo(0.25f, 0.5f)
+                      path.close()
+                      p.style = Paint.Style.FILL
+                      p.shader = LinearGradient(0f, 0f, 2.7f, 0f, 0xFFF4F6FA.toInt(), 0xFFB9C3D3.toInt(), Shader.TileMode.CLAMP)
+                      c.drawPath(path, p)
+                      p.shader = null
+                      stroke(c, 0xFF8E98A8.toInt(), 0.03f)
+                      p.style = Paint.Style.STROKE; p.strokeWidth = 0.03f; p.color = 0xFF9AA5B8.toInt()
+                      c.drawLine(0.35f, 0f, 2.6f, -0.05f, p)
+                      c.drawLine(0.35f, 0.05f, 2.3f, 0.3f, p)
+                      c.drawLine(0.35f, 0.1f, 1.9f, 0.6f, p)
+                      c.restore()
+                  }
+
+                  // hooves tucked under body
+                  for (sx in floatArrayOf(-0.32f, 0.32f)) for (y in floatArrayOf(-0.3f, 0.6f))
+                      oval(c, sx - 0.1f, y - 0.1f, sx + 0.1f, y + 0.1f, 0xFFD5DBE6.toInt())
+
+                  // torso
+                  rect.set(-0.36f, -0.6f, 0.36f, 0.9f)
+                  p.style = Paint.Style.FILL
+                  p.shader = LinearGradient(-0.36f, 0f, 0.36f, 0f,
+                      intArrayOf(0xFFAEB8C6.toInt(), 0xFFF7F9FC.toInt(), 0xFFAEB8C6.toInt()), null, Shader.TileMode.CLAMP)
+                  c.drawOval(rect, p)
+                  p.shader = null
+
+                  // neck, mane, head
+                  poly(-0.17f, -0.5f, 0.17f, -0.5f, 0.12f, -1.1f, -0.12f, -1.1f)
+                  fill(c, 0xFFE9EDF3.toInt())
+                  rrect(c, -0.05f, -1.1f, 0.05f, -0.45f, 0.05f, 0xFF8FA8D0.toInt())
+                  poly(-0.16f, -1.15f, -0.27f, -1.28f, -0.1f, -1.28f); fill(c, 0xFFE9EDF3.toInt())
+                  poly(0.16f, -1.15f, 0.27f, -1.28f, 0.1f, -1.28f); fill(c, 0xFFE9EDF3.toInt())
+                  oval(c, -0.17f, -1.55f, 0.17f, -1.0f, 0xFFF2F4F8.toInt())
+                  oval(c, -0.11f, -1.7f, 0.11f, -1.4f, 0xFFE3E8F0.toInt())
+                  oval(c, -0.13f, -1.38f, -0.07f, -1.32f, 0xFF1B2433.toInt())
+                  oval(c, 0.07f, -1.38f, 0.13f, -1.32f, 0xFF1B2433.toInt())
+
+                  c.restoreToCount(layer)
+              }
+          }
+          FILE_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/forenzanav/MainActivity.kt')"
+          cat > 'app/src/main/java/com/example/forenzanav/MainActivity.kt' <<'FILE_EOF'
+          package com.example.forenzanav
+
+          import android.Manifest
+          import android.animation.ValueAnimator
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.pm.PackageManager
+          import android.location.Location
+          import android.location.LocationListener
+          import android.location.LocationManager
+          import android.os.Bundle
+          import android.os.SystemClock
+          import android.speech.tts.TextToSpeech
+          import android.view.MotionEvent
+          import android.view.View
+          import android.view.animation.LinearInterpolator
+          import android.view.inputmethod.EditorInfo
+          import android.view.inputmethod.InputMethodManager
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.TextView
+          import android.widget.Toast
+          import org.osmdroid.config.Configuration
+          import org.osmdroid.tileprovider.tilesource.TileSourceFactory
+          import org.osmdroid.util.GeoPoint
+          import org.osmdroid.views.CustomZoomButtonsController
+          import org.osmdroid.views.MapView
+          import org.osmdroid.views.overlay.Marker
+          import org.osmdroid.views.overlay.Polyline
+          import org.osmdroid.views.overlay.TilesOverlay
+          import java.io.File
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Locale
+          import kotlin.math.max
+          import kotlin.math.roundToInt
+
+          class MainActivity : Activity(), LocationListener, TextToSpeech.OnInitListener {
+
+              companion object {
+                  const val MORPH_UP_MPH = 35.0     // car -> Pegasus at/above this speed
+                  const val MORPH_DOWN_MPH = 30.0   // Pegasus -> car below this speed
+                  const val REQ_LOC = 1
+              }
+
+              private lateinit var map: MapView
+              private lateinit var car: CarView
+              private lateinit var speedView: TextView
+              private lateinit var search: EditText
+              private lateinit var banner: View
+              private lateinit var instruction: TextView
+              private lateinit var distanceView: TextView
+              private lateinit var bottomBar: View
+              private lateinit var etaView: TextView
+              private lateinit var recenter: Button
+              private lateinit var lm: LocationManager
+
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+
+              // location / camera
+              private var locationStarted = false
+              private var lastLoc: Location? = null
+              private var lastGpsTime = 0L
+              private var bearing = 0f
+              private var follow = true
+              private var camInit = false
+              private var camLat = 0.0
+              private var camLon = 0.0
+              private var camBrg = 0f
+              private var camZoom = 17.0
+              private var camAnim: ValueAnimator? = null
+              private var night = false
+
+              // morph
+              private var morphTarget = 0f
+              private var morphAnim: ValueAnimator? = null
+              private var demoMph = -1.0
+
+              // navigation
+              private var route: Route? = null
+              private var dest: GeoPoint? = null
+              private var routeLine: Polyline? = null
+              private var destMarker: Marker? = null
+              private var stepIdx = 0
+              private var minDist = Double.MAX_VALUE
+              private var said400 = false
+              private var said80 = false
+              private var offCount = 0
+              private var rerouting = false
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  Configuration.getInstance().apply {
+                      userAgentValue = packageName
+                      osmdroidBasePath = File(cacheDir, "osmdroid")
+                      osmdroidTileCache = File(cacheDir, "osmdroid/tiles")
+                  }
+                  setContentView(R.layout.activity_main)
+
+                  map = findViewById(R.id.map)
+                  car = findViewById(R.id.car)
+                  speedView = findViewById(R.id.speed)
+                  search = findViewById(R.id.search)
+                  banner = findViewById(R.id.banner)
+                  instruction = findViewById(R.id.instruction)
+                  distanceView = findViewById(R.id.distance)
+                  bottomBar = findViewById(R.id.bottomBar)
+                  etaView = findViewById(R.id.eta)
+                  recenter = findViewById(R.id.recenter)
+                  lm = getSystemService(LOCATION_SERVICE) as LocationManager
+
+                  map.setTileSource(TileSourceFactory.MAPNIK)
+                  map.setMultiTouchControls(true)
+                  map.isTilesScaledToDpi = true
+                  map.zoomController.setVisibility(CustomZoomButtonsController.Visibility.NEVER)
+                  map.controller.setZoom(17.0)
+
+                  map.setOnTouchListener { _, e ->
+                      if (e.action == MotionEvent.ACTION_MOVE && follow) {
+                          follow = false
+                          recenter.visibility = View.VISIBLE
+                      }
+                      false
+                  }
+
+                  recenter.setOnClickListener {
+                      follow = true
+                      recenter.visibility = View.GONE
+                      lastLoc?.let { moveCamera(it.latitude, it.longitude, bearing, zoomFor(currentMph())) }
+                  }
+
+                  findViewById<Button>(R.id.night).setOnClickListener {
+                      night = !night
+                      map.overlayManager.tilesOverlay.setColorFilter(if (night) TilesOverlay.INVERT_COLORS else null)
+                      map.invalidate()
+                  }
+
+                  findViewById<Button>(R.id.cancel).setOnClickListener { clearRoute() }
+
+                  findViewById<Button>(R.id.go).setOnClickListener { doSearch() }
+                  search.setOnEditorActionListener { _, id, _ ->
+                      if (id == EditorInfo.IME_ACTION_SEARCH) { doSearch(); true } else false
+                  }
+
+                  // Tap the speed bubble to demo the morph without driving: off -> 50 mph -> 0 mph -> off
+                  speedView.setOnClickListener {
+                      demoMph = when {
+                          demoMph < 0 -> 50.0
+                          demoMph > 0 -> 0.0
+                          else -> -1.0
+                      }
+                      Toast.makeText(
+                          this,
+                          if (demoMph < 0) "Demo off - using GPS speed" else "Demo speed ${demoMph.roundToInt()} mph",
+                          Toast.LENGTH_SHORT
+                      ).show()
+                      updateSpeed(currentMph())
+                  }
+
+                  tts = TextToSpeech(this, this)
+                  updateSpeed(0.0)
+
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                      requestPermissions(
+                          arrayOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION),
+                          REQ_LOC
+                      )
+                  }
+              }
+
+              // ------------------------------------------------------------ lifecycle
+              override fun onResume() {
+                  super.onResume()
+                  map.onResume()
+                  if (checkSelfPermission(Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED) startLocation()
+              }
+
+              override fun onPause() {
+                  super.onPause()
+                  map.onPause()
+                  try { lm.removeUpdates(this) } catch (_: Exception) {}
+                  locationStarted = false
+              }
+
+              override fun onDestroy() {
+                  super.onDestroy()
+                  tts?.shutdown()
+              }
+
+              override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == REQ_LOC && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      startLocation()
+                  } else {
+                      Toast.makeText(this, "Location permission is needed for navigation", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              override fun onInit(status: Int) {
+                  if (status == TextToSpeech.SUCCESS) {
+                      tts?.language = Locale.US
+                      ttsReady = true
+                  }
+              }
+
+              private fun speak(text: String) {
+                  if (ttsReady) tts?.speak(text, TextToSpeech.QUEUE_FLUSH, null, "nav")
+              }
+
+              // ------------------------------------------------------------ location
+              @SuppressLint("MissingPermission")
+              private fun startLocation() {
+                  if (locationStarted) return
+                  try {
+                      for (p in listOf(LocationManager.GPS_PROVIDER, LocationManager.NETWORK_PROVIDER)) {
+                          if (lm.isProviderEnabled(p)) lm.requestLocationUpdates(p, 1000L, 0f, this)
+                      }
+                      locationStarted = true
+                      val last = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
+                          ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
+                      if (last != null) {
+                          lastLoc = last
+                          moveCamera(last.latitude, last.longitude, bearing, 17.0)
+                      }
+                  } catch (e: Exception) {
+                      Toast.makeText(this, "Could not start GPS: ${e.message}", Toast.LENGTH_LONG).show()
+                  }
+              }
+
+              override fun onLocationChanged(loc: Location) {
+                  val isGps = loc.provider == LocationManager.GPS_PROVIDER
+                  val now = SystemClock.elapsedRealtime()
+                  if (isGps) lastGpsTime = now else if (now - lastGpsTime < 10000) return
+
+                  lastLoc = loc
+                  if (isGps && loc.hasBearing() && loc.hasSpeed() && loc.speed > 1.5f) bearing = loc.bearing
+
+                  val mph = currentMph()
+                  updateSpeed(mph)
+                  if (follow) moveCamera(loc.latitude, loc.longitude, bearing, zoomFor(mph))
+                  if (route != null) updateNavigation(loc)
+              }
+
+              @Deprecated("Required on older Android versions")
+              override fun onStatusChanged(provider: String?, status: Int, extras: Bundle?) {}
+              override fun onProviderEnabled(provider: String) {}
+              override fun onProviderDisabled(provider: String) {}
+
+              private fun currentMph(): Double {
+                  if (demoMph >= 0) return demoMph
+                  val l = lastLoc ?: return 0.0
+                  return if (l.hasSpeed()) l.speed * 2.23694 else 0.0
+              }
+
+              private fun zoomFor(mph: Double) = (18.0 - mph / 25.0).coerceIn(15.5, 18.0)
+
+              // ------------------------------------------------------------ speed + morph
+              private fun updateSpeed(mph: Double) {
+                  speedView.text = "${mph.roundToInt()}\nmph"
+                  val target = when {
+                      morphTarget == 0f && mph >= MORPH_UP_MPH -> 1f
+                      morphTarget == 1f && mph < MORPH_DOWN_MPH -> 0f
+                      else -> morphTarget
+                  }
+                  if (target != morphTarget) {
+                      morphTarget = target
+                      morphAnim?.cancel()
+                      val a = ValueAnimator.ofFloat(car.morph, target)
+                      a.duration = 900
+                      a.addUpdateListener { car.morph = it.animatedValue as Float }
+                      a.start()
+                      morphAnim = a
+                  }
+              }
+
+              // ------------------------------------------------------------ camera
+              private fun applyCamera() {
+                  map.controller.setCenter(GeoPoint(camLat, camLon))
+                  map.mapOrientation = -camBrg
+                  map.controller.setZoom(camZoom)
+              }
+
+              private fun moveCamera(lat: Double, lon: Double, brg: Float, zoom: Double) {
+                  camAnim?.cancel()
+                  if (!camInit) {
+                      camInit = true
+                      camLat = lat; camLon = lon; camBrg = brg; camZoom = zoom
+                      applyCamera()
+                      return
+                  }
+                  val sLat = camLat; val sLon = camLon; val sBrg = camBrg; val sZoom = camZoom
+                  val d = ((brg - sBrg + 540f) % 360f) - 180f   // shortest rotation
+                  val a = ValueAnimator.ofFloat(0f, 1f)
+                  a.duration = 900
+                  a.interpolator = LinearInterpolator()
+                  a.addUpdateListener {
+                      val f = it.animatedFraction
+                      camLat = sLat + (lat - sLat) * f
+                      camLon = sLon + (lon - sLon) * f
+                      camBrg = ((sBrg + d * f) + 360f) % 360f
+                      camZoom = sZoom + (zoom - sZoom) * f
+                      applyCamera()
+                  }
+                  a.start()
+                  camAnim = a
+              }
+
+              // ------------------------------------------------------------ search + routing
+              private fun doSearch() {
+                  val q = search.text.toString().trim()
+                  if (q.isEmpty()) return
+                  (getSystemService(INPUT_METHOD_SERVICE) as InputMethodManager).hideSoftInputFromWindow(search.windowToken, 0)
+                  val from = lastLoc
+                  if (from == null) {
+                      Toast.makeText(this, "Waiting for a GPS fix...", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  Toast.makeText(this, "Searching...", Toast.LENGTH_SHORT).show()
+                  Thread {
+                      try {
+                          val to = Nav.geocode(q, from)
+                          if (to == null) {
+                              runOnUiThread { Toast.makeText(this, "Place not found", Toast.LENGTH_LONG).show() }
+                              return@Thread
+                          }
+                          val r = Nav.route(GeoPoint(from.latitude, from.longitude), to)
+                          runOnUiThread {
+                              if (r == null) Toast.makeText(this, "No route found", Toast.LENGTH_LONG).show()
+                              else startRoute(r, to)
+                          }
+                      } catch (e: Exception) {
+                          runOnUiThread { Toast.makeText(this, "Network error: ${e.message}", Toast.LENGTH_LONG).show() }
+                      }
+                  }.start()
+              }
+
+              private fun startRoute(r: Route, to: GeoPoint) {
+                  clearRoute()
+                  route = r
+                  dest = to
+                  stepIdx = 0
+                  minDist = Double.MAX_VALUE
+                  said400 = false; said80 = false; offCount = 0
+
+                  val line = Polyline(map)
+                  line.setPoints(r.pts)
+                  line.outlinePaint.color = 0xFF1E88E5.toInt()
+                  line.outlinePaint.strokeWidth = 18f
+                  map.overlays.add(line)
+                  routeLine = line
+
+                  val m = Marker(map)
+                  m.position = to
+                  m.setAnchor(Marker.ANCHOR_CENTER, Marker.ANCHOR_BOTTOM)
+                  map.overlays.add(m)
+                  destMarker = m
+                  map.invalidate()
+
+                  banner.visibility = View.VISIBLE
+                  bottomBar.visibility = View.VISIBLE
+                  follow = true
+                  recenter.visibility = View.GONE
+                  speak("Route started")
+                  lastLoc?.let { updateNavigation(it) }
+              }
+
+              private fun clearRoute() {
+                  route = null
+                  dest = null
+                  routeLine?.let { map.overlays.remove(it) }
+                  destMarker?.let { map.overlays.remove(it) }
+                  routeLine = null; destMarker = null
+                  banner.visibility = View.GONE
+                  bottomBar.visibility = View.GONE
+                  map.invalidate()
+              }
+
+              private fun updateNavigation(loc: Location) {
+                  val r = route ?: return
+                  val here = GeoPoint(loc.latitude, loc.longitude)
+
+                  // off-route -> reroute
+                  if (Nav.distanceToRoute(here, r.pts) > 60.0) offCount++ else offCount = 0
+                  if (offCount >= 3 && !rerouting) {
+                      rerouting = true
+                      offCount = 0
+                      speak("Rerouting")
+                      val to = dest
+                      Thread {
+                          try {
+                              val nr = if (to != null) Nav.route(here, to) else null
+                              runOnUiThread { if (nr != null && dest == to) startRoute(nr, to!!) }
+                          } catch (_: Exception) {
+                          } finally {
+                              rerouting = false
+                          }
+                      }.start()
+                      return
+                  }
+
+                  val steps = r.steps
+                  if (stepIdx + 1 >= steps.size) return
+                  var next = steps[stepIdx + 1]
+                  var d = Nav.dist(here, next.loc)
+                  if (d < minDist) minDist = d
+
+                  val reach = max(30.0, loc.speed * 2.0)
+                  val passed = minDist < 80.0 && d > minDist + 15.0
+                  if (d < reach || passed) {
+                      if (stepIdx + 1 == steps.size - 1) {      // that was the arrival step
+                          speak("You have arrived")
+                          Toast.makeText(this, "You have arrived", Toast.LENGTH_LONG).show()
+                          clearRoute()
+                          return
+                      }
+                      stepIdx++
+                      minDist = Double.MAX_VALUE
+                      said400 = false; said80 = false
+                      next = steps[stepIdx + 1]
+                      d = Nav.dist(here, next.loc)
+                  }
+
+                  instruction.text = next.text
+                  distanceView.text = fmtDist(d)
+
+                  if (d < 450 && !said400) { said400 = true; speak("In ${fmtDist(d)}, ${next.text}") }
+                  if (d < 80 && !said80) { said80 = true; speak(next.text) }
+
+                  var remaining = d
+                  for (i in stepIdx + 1 until steps.size) remaining += steps[i].dist
+                  val secs = if (r.dist > 0) r.dur * remaining / r.dist else 0.0
+                  val eta = Calendar.getInstance().apply { add(Calendar.SECOND, secs.roundToInt()) }
+                  etaView.text = "${(secs / 60).roundToInt()} min  |  ${fmtDist(remaining)}  |  " +
+                      SimpleDateFormat("h:mm a", Locale.US).format(eta.time)
+              }
+
+              private fun fmtDist(m: Double): String {
+                  return if (m < 160) "${((m * 3.28084) / 10).roundToInt() * 10} ft"
+                  else String.format(Locale.US, "%.1f mi", m / 1609.344)
+              }
+          }
+          FILE_EOF
+          mkdir -p "$(dirname 'app/src/main/java/com/example/forenzanav/Nav.kt')"
+          cat > 'app/src/main/java/com/example/forenzanav/Nav.kt' <<'FILE_EOF'
+          package com.example.forenzanav
+
+          import android.location.Location
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.osmdroid.util.GeoPoint
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.net.URLEncoder
+          import kotlin.math.cos
+          import kotlin.math.hypot
+
+          /** A maneuver (text + where it happens) and the length of the road that follows it. */
+          data class Step(val text: String, val loc: GeoPoint, val dist: Double)
+
+          class Route(val pts: List<GeoPoint>, val steps: List<Step>, val dist: Double, val dur: Double)
+
+          object Nav {
+
+              private const val UA = "ForenzaNav/1.0 (hobby Android app)"
+
+              private fun httpGet(url: String): String {
+                  val c = URL(url).openConnection() as HttpURLConnection
+                  c.setRequestProperty("User-Agent", UA)
+                  c.connectTimeout = 10000
+                  c.readTimeout = 20000
+                  try {
+                      return c.inputStream.bufferedReader().use { it.readText() }
+                  } finally {
+                      c.disconnect()
+                  }
+              }
+
+              /** Free-text place search via OpenStreetMap Nominatim, biased toward the current position. */
+              fun geocode(query: String, near: Location?): GeoPoint? {
+                  var url = "https://nominatim.openstreetmap.org/search?format=json&limit=1&q=" +
+                      URLEncoder.encode(query, "UTF-8")
+                  if (near != null) {
+                      val l = near.longitude - 0.6; val r = near.longitude + 0.6
+                      val t = near.latitude + 0.6; val b = near.latitude - 0.6
+                      url += "&viewbox=$l,$t,$r,$b"
+                  }
+                  val arr = JSONArray(httpGet(url))
+                  if (arr.length() == 0) return null
+                  val o = arr.getJSONObject(0)
+                  return GeoPoint(o.getString("lat").toDouble(), o.getString("lon").toDouble())
+              }
+
+              /** Driving route via the public OSRM demo server. */
+              fun route(from: GeoPoint, to: GeoPoint): Route? {
+                  val url = "https://router.project-osrm.org/route/v1/driving/" +
+                      "${from.longitude},${from.latitude};${to.longitude},${to.latitude}" +
+                      "?overview=full&geometries=geojson&steps=true"
+                  val j = JSONObject(httpGet(url))
+                  if (j.optString("code") != "Ok") return null
+                  val r = j.getJSONArray("routes").getJSONObject(0)
+
+                  val coords = r.getJSONObject("geometry").getJSONArray("coordinates")
+                  val pts = List(coords.length()) {
+                      val c = coords.getJSONArray(it)
+                      GeoPoint(c.getDouble(1), c.getDouble(0))
+                  }
+
+                  val steps = ArrayList<Step>()
+                  val legSteps = r.getJSONArray("legs").getJSONObject(0).getJSONArray("steps")
+                  for (i in 0 until legSteps.length()) {
+                      val s = legSteps.getJSONObject(i)
+                      val m = s.getJSONObject("maneuver")
+                      val ll = m.getJSONArray("location")
+                      steps.add(
+                          Step(
+                              describe(m.optString("type"), m.optString("modifier"), s.optString("name"), m.optInt("exit", 0)),
+                              GeoPoint(ll.getDouble(1), ll.getDouble(0)),
+                              s.getDouble("distance")
+                          )
+                      )
+                  }
+                  return Route(pts, steps, r.getDouble("distance"), r.getDouble("duration"))
+              }
+
+              private fun ordinal(n: Int) = when (n) { 1 -> "1st"; 2 -> "2nd"; 3 -> "3rd"; else -> "${n}th" }
+
+              private fun dir(mod: String) = when (mod) {
+                  "slight left" -> "left"
+                  "slight right" -> "right"
+                  "sharp left" -> "left"
+                  "sharp right" -> "right"
+                  "" -> "ahead"
+                  else -> mod
+              }
+
+              private fun describe(type: String, mod: String, name: String, exit: Int): String {
+                  val onto = if (name.isNotBlank()) " onto $name" else ""
+                  val on = if (name.isNotBlank()) " on $name" else ""
+                  return when (type) {
+                      "arrive" -> "Arrive at your destination"
+                      "depart" -> "Head out$on"
+                      "roundabout", "rotary", "roundabout turn", "exit roundabout", "exit rotary" ->
+                          if (exit > 0) "At the roundabout, take the ${ordinal(exit)} exit$onto"
+                          else "Enter the roundabout$onto"
+                      "merge" -> "Merge ${dir(mod)}$onto"
+                      "on ramp" -> "Take the ramp ${dir(mod)}$onto"
+                      "off ramp" -> "Take the exit ${dir(mod)}$onto"
+                      "fork" -> "Keep ${dir(mod)}$onto"
+                      else -> when (mod) {
+                          "straight", "" -> "Continue straight$on"
+                          "uturn" -> "Make a U-turn$on"
+                          "slight left" -> "Bear left$onto"
+                          "slight right" -> "Bear right$onto"
+                          "sharp left" -> "Sharp left$onto"
+                          "sharp right" -> "Sharp right$onto"
+                          else -> "Turn $mod$onto"
+                      }
+                  }
+              }
+
+              fun dist(a: GeoPoint, b: GeoPoint): Double {
+                  val out = FloatArray(1)
+                  Location.distanceBetween(a.latitude, a.longitude, b.latitude, b.longitude, out)
+                  return out[0].toDouble()
+              }
+
+              /** Shortest distance (meters) from p to the route polyline. */
+              fun distanceToRoute(p: GeoPoint, pts: List<GeoPoint>): Double {
+                  val kx = 111320.0 * cos(Math.toRadians(p.latitude))
+                  val ky = 110540.0
+                  var best = Double.MAX_VALUE
+                  for (i in 0 until pts.size - 1) {
+                      val ax = (pts[i].longitude - p.longitude) * kx
+                      val ay = (pts[i].latitude - p.latitude) * ky
+                      val bx = (pts[i + 1].longitude - p.longitude) * kx
+                      val by = (pts[i + 1].latitude - p.latitude) * ky
+                      val dx = bx - ax; val dy = by - ay
+                      val len2 = dx * dx + dy * dy
+                      val t = if (len2 == 0.0) 0.0 else ((-ax * dx - ay * dy) / len2).coerceIn(0.0, 1.0)
+                      val d = hypot(ax + t * dx, ay + t * dy)
+                      if (d < best) best = d
+                  }
+                  return best
+              }
+          }
+          FILE_EOF
+          mkdir -p "$(dirname 'app/src/main/res/drawable/bubble.xml')"
+          cat > 'app/src/main/res/drawable/bubble.xml' <<'FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <shape xmlns:android="http://schemas.android.com/apk/res/android" android:shape="oval">
+              <solid android:color="#E6101820" />
+              <stroke android:width="3dp" android:color="#FFFFFF" />
+          </shape>
+          FILE_EOF
+          mkdir -p "$(dirname 'app/src/main/res/layout/activity_main.xml')"
+          cat > 'app/src/main/res/layout/activity_main.xml' <<'FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <FrameLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent">
+
+              <org.osmdroid.views.MapView
+                  android:id="@+id/map"
+                  android:layout_width="match_parent"
+                  android:layout_height="match_parent" />
+
+              <com.example.forenzanav.CarView
+                  android:id="@+id/car"
+                  android:layout_width="220dp"
+                  android:layout_height="220dp"
+                  android:layout_gravity="center" />
+
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_gravity="top"
+                  android:orientation="vertical"
+                  android:padding="8dp">
+
+                  <LinearLayout
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:background="#FFFFFF"
+                      android:orientation="horizontal">
+
+                      <EditText
+                          android:id="@+id/search"
+                          android:layout_width="0dp"
+                          android:layout_height="wrap_content"
+                          android:layout_weight="1"
+                          android:background="@android:color/transparent"
+                          android:hint="Where to?"
+                          android:imeOptions="actionSearch"
+                          android:inputType="text"
+                          android:maxLines="1"
+                          android:padding="12dp"
+                          android:textColor="#111111"
+                          android:textColorHint="#777777" />
+
+                      <Button
+                          android:id="@+id/go"
+                          android:layout_width="wrap_content"
+                          android:layout_height="wrap_content"
+                          android:text="Go" />
+                  </LinearLayout>
+
+                  <LinearLayout
+                      android:id="@+id/banner"
+                      android:layout_width="match_parent"
+                      android:layout_height="wrap_content"
+                      android:layout_marginTop="8dp"
+                      android:background="#E6102030"
+                      android:orientation="vertical"
+                      android:padding="14dp"
+                      android:visibility="gone">
+
+                      <TextView
+                          android:id="@+id/instruction"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:textColor="#FFFFFF"
+                          android:textSize="20sp"
+                          android:textStyle="bold" />
+
+                      <TextView
+                          android:id="@+id/distance"
+                          android:layout_width="match_parent"
+                          android:layout_height="wrap_content"
+                          android:textColor="#8FD3FF"
+                          android:textSize="28sp" />
+                  </LinearLayout>
+              </LinearLayout>
+
+              <LinearLayout
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_gravity="end|center_vertical"
+                  android:layout_marginEnd="8dp"
+                  android:orientation="vertical">
+
+                  <Button
+                      android:id="@+id/recenter"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Re-center"
+                      android:visibility="gone" />
+
+                  <Button
+                      android:id="@+id/night"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="Night" />
+              </LinearLayout>
+
+              <TextView
+                  android:id="@+id/speed"
+                  android:layout_width="92dp"
+                  android:layout_height="92dp"
+                  android:layout_gravity="bottom|start"
+                  android:layout_margin="16dp"
+                  android:background="@drawable/bubble"
+                  android:gravity="center"
+                  android:text="0\nmph"
+                  android:textColor="#FFFFFF"
+                  android:textSize="24sp"
+                  android:textStyle="bold" />
+
+              <LinearLayout
+                  android:id="@+id/bottomBar"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_gravity="bottom"
+                  android:layout_marginStart="120dp"
+                  android:layout_marginEnd="8dp"
+                  android:layout_marginBottom="16dp"
+                  android:background="#E6102030"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal"
+                  android:padding="10dp"
+                  android:visibility="gone">
+
+                  <TextView
+                      android:id="@+id/eta"
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:textColor="#FFFFFF"
+                      android:textSize="16sp" />
+
+                  <Button
+                      android:id="@+id/cancel"
+                      android:layout_width="wrap_content"
+                      android:layout_height="wrap_content"
+                      android:text="End" />
+              </LinearLayout>
+          </FrameLayout>
+          FILE_EOF
+          mkdir -p "$(dirname 'build.gradle.kts')"
+          cat > 'build.gradle.kts' <<'FILE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FILE_EOF
+          mkdir -p "$(dirname 'gradle.properties')"
+          cat > 'gradle.properties' <<'FILE_EOF'
+          org.gradle.jvmargs=-Xmx2g -Dfile.encoding=UTF-8
+          android.useAndroidX=false
+          android.nonTransitiveRClass=true
+          kotlin.code.style=official
+          FILE_EOF
+          mkdir -p "$(dirname 'settings.gradle.kts')"
+          cat > 'settings.gradle.kts' <<'FILE_EOF'
+          pluginManagement {
+              repositories { google(); mavenCentral(); gradlePluginPortal() }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories { google(); mavenCentral() }
+          }
+          rootProject.name = "ForenzaNav"
+          include(":app")
+          FILE_EOF
+      - name: Build debug APK
+        working-directory: ForenzaNav
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp ForenzaNav/app/build/outputs/apk/debug/app-debug.apk ForenzaNav.apk
+          gh release create "build-${{ github.run_number }}" ForenzaNav.apk -R "${{ github.repository }}" --title "ForenzaNav build ${{ github.run_number }}" --notes "Download ForenzaNav.apk and install it."
